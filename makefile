@@ -1,2 +1,5 @@
 news_server: server.c
-	gcc server.c -Wall -Wextra -o news_server
+	gcc server.c -Wall -Wextra -pthread -g -o news_server
+
+client: tcp_client.c
+	gcc tcp_client.c -Wall -Wextra -pthread -g -o client
