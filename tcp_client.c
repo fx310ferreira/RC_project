@@ -34,7 +34,6 @@ int main(int argc, char *argv[]) {
 	  erro("socket");
   if (connect(fd,(struct sockaddr *)&addr,sizeof (addr)) < 0)
 	  erro("Connect");
- 
 
 // Create the arrays to store the response and the domain 
   char msg[1024], domain[1024];

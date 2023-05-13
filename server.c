@@ -32,7 +32,7 @@ User* users;
 int* n_childs;
 int shmid;
 int users_size = 0;
-int udp_socket,recv_len, port_cofig, tcp_port, udp_thread = 0;
+int udp_socket,recv_len, port_cofig, tcp_port, udp_thread = 0, tcp_client_n, parent_pid, tcp_socket, leave = 0;
 struct sockaddr_in si_upd_client;
 pthread_t udp_server_t;
 sem_t *users_sem, *n_childs_sem;
@@ -62,6 +62,8 @@ void cleanup(){
     pthread_cancel(udp_server_t);
   }
   pthread_join(udp_server_t, NULL);
+
+  printf("Wating for workers to exit\n");
   for (int i = 0; i < *n_childs; i++){
     wait(NULL);
   }
@@ -70,6 +72,7 @@ void cleanup(){
   save_file();
   //closing the udp socket
   close(udp_socket);
+  close(tcp_socket);
   sem_close(users_sem);
   sem_unlink("users_sem");
   shmdt(users);
@@ -158,40 +161,44 @@ unsigned int login(char * buffer){
   }
 }
 
-void tcp_client(int client_fd){
+void tcp_client(){
   sem_wait(users_sem);
   *n_childs = *n_childs+1;
   sem_post(users_sem);
-	int nread = 0;
+	int nread;
   // Creates 2 strings for future use
 	char buffer[1024], msg[1246];
   // Send the message to the conected client
-  sprintf(msg, "Bem-vindo ao servidor de nomes do DEI. Indique o nome de domínio");
-  write(client_fd, msg, 1024);
+  sprintf(msg, "Welcome to the news server, login usign: LOGIN {username} {password}\n");
+  write(tcp_client_n, msg, 1024);
   do {
+    // Leave if ctrl+c is pressed
+    if(leave){
+      printf("Closing client\n");
+      close(tcp_client_n);
+      break;
+    }
+
     // Reads the domain sent by the client
-    nread = read(client_fd, buffer, 1024);
-    // If a string is received continues
-    if(nread > 0){
-      // If the received string equals "SAIR" sends the message "Ate logo!" to client and closes the connection
-      if(strcmp(buffer, "SAIR") != 0){
-        int found = 0;
-        // Searches the file for the domain received
-        // If no equal domain is found in the file the server sends the message bellow
-        if(!found){
-          sprintf(msg, "O nome de domínio %s não tem um endereço IP associado", buffer);
-        }
-        write(client_fd, msg, 1024);
-      }else{
-        // If the message sent by the client is equal to "SAIR" the server responds with the message "Ate logo!" 
-        sprintf(msg, "Até logo!");
-        write(client_fd, msg, 1024);
-        break;
-      }
+    if((nread = read(tcp_client_n, buffer, 1024)) <= 0) continue;
+
+    // If the received string equals "SAIR" sends the message "Ate logo!" to client and closes the connection
+    if(strcmp(buffer, "SAIR") != 0){
+      // If no equal domain is found in the file the server sends the message bellow
+      sprintf(msg, "O nome de domínio %s não tem um endereço IP associado", buffer);
+      write(tcp_client_n, msg, 1024);
+    }else{
+      // If the message sent by the client is equal to "SAIR" the server responds with the message "Ate logo!" 
+      sprintf(msg, "Até logo!");
+      write(tcp_client_n, msg, 1024);
+      sem_wait(users_sem);
+      *n_childs = *n_childs+1;
+      sem_post(users_sem);
+      break;
     }
 	  fflush(stdout);
   } while (1);
-	close(client_fd);
+	close(tcp_client_n);
 }
 
 void *udp_server(){
@@ -312,7 +319,6 @@ void *udp_server(){
 }
 
 void tcp_server(){
-  int fd, client;
   struct sockaddr_in addr, client_addr;
   int client_addr_size;
 
@@ -321,29 +327,26 @@ void tcp_server(){
   addr.sin_addr.s_addr = htonl(INADDR_ANY);
   addr.sin_port = htons(tcp_port);
 
-  if ( (fd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+  if ( (tcp_socket = socket(AF_INET, SOCK_STREAM, 0)) < 0)
 	  error("na funcao socket");
-  if ( bind(fd,(struct sockaddr*)&addr,sizeof(addr)) < 0)
+  if ( bind(tcp_socket,(struct sockaddr*)&addr,sizeof(addr)) < 0)
 	  error("na funcao bind");
-  if( listen(fd, 5) < 0)
+  if( listen(tcp_socket, 5) < 0) //! change to increase number of connections
 	  error("na funcao listen");
 
   client_addr_size = sizeof(client_addr);
 
   while (1) {
     //wait for new connection
-    client = accept(fd,(struct sockaddr *)&client_addr,(socklen_t *)&client_addr_size);
+    tcp_client_n = accept(tcp_socket,(struct sockaddr *)&client_addr,(socklen_t *)&client_addr_size);
     
-    if (client > 0) {
-      sem_wait(n_childs_sem);
-      *n_childs = *n_childs + 1;
-      sem_post(n_childs_sem);
+    if (tcp_client_n > 0) {
       if (fork() == 0) {
-        close(fd);
-        tcp_client(client);
+        close(tcp_socket);
+        tcp_client();
         exit(0);
       }
-    close(client);
+    close(tcp_client_n);
     }
   }
 }
@@ -376,11 +379,16 @@ void syc_creator(){
 }
 
 void ctrlc_handler(){
+  if(getpid() == parent_pid){
     printf("\nSIGINT recived\n");
     cleanup();
+  }else{
+    leave = 1;
+  }
 }
 
 int main(int argc, char* argv[]) { 
+  parent_pid = getpid();
 
     // Initialize the signal handler
   struct sigaction ctrlc;
