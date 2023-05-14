@@ -20,34 +20,50 @@
 // ! QUIT SERVER WHEN WRITING QUIT_SERVER BEFORE LOGIN
 #define BUFLEN 2056	// Tamanho do buffer
 #define SIZE 128 
-#define MAX_USERS 4
+#define BUF_SIZE 1024
+#define MAX_USERS 100
+#define MAX_TOPICS 100
 typedef struct User{
   char username[SIZE];
   char password[SIZE];
   int role;
 } User;
 
+typedef struct Topic{
+  char name[SIZE];
+  char id[SIZE];
+  struct sockaddr_in addr;
+  int multicast_socket;
+  }Topic;
+
+typedef struct Shm{
+  User* users;
+  Topic* topics;
+  int n_childs;
+  int users_size;
+  int topics_size;
+  int port;
+}Shm;
+
 char config_file[BUFLEN];
-User* users;
-int* n_childs;
 int shmid;
-int users_size = 0;
+Shm *shm;
 int udp_socket,recv_len, port_cofig, tcp_port, udp_thread = 0, tcp_client_n, parent_pid, tcp_socket, leave = 0;
 struct sockaddr_in si_upd_client;
 pthread_t udp_server_t;
-sem_t *users_sem, *n_childs_sem;
+sem_t *users_sem, *n_childs_sem, *topics_sem;
 
 void save_file(){
   FILE *fp = fopen(config_file, "w");
 
   int i;
-  for(i = 0; i < users_size; i++){
-    fprintf(fp, "%s;%s;", users[i].username, users[i].password);
-    if(users[i].role == 1){
+  for(i = 0; i < shm->users_size; i++){
+    fprintf(fp, "%s;%s;", shm->users[i].username, shm->users[i].password);
+    if(shm->users[i].role == 1){
       fprintf(fp, "administrador\n");
-    }else if(users[i].role == 2){
+    }else if(shm->users[i].role == 2){
       fprintf(fp, "jornalista\n");
-    }else if(users[i].role == 3){
+    }else if(shm->users[i].role == 3){
       fprintf(fp, "leitor\n");
     }else{
       printf("Error wrong role\n");
@@ -64,7 +80,7 @@ void cleanup(){
   pthread_join(udp_server_t, NULL);
 
   printf("Wating for workers to exit\n");
-  for (int i = 0; i < *n_childs; i++){
+  for (int i = 0; i < shm->n_childs; i++){
     wait(NULL);
   }
   
@@ -75,7 +91,11 @@ void cleanup(){
   close(tcp_socket);
   sem_close(users_sem);
   sem_unlink("users_sem");
-  shmdt(users);
+  sem_close(topics_sem);
+  sem_unlink("topics_sem");
+  sem_close(n_childs_sem);
+  sem_unlink("n_childs_sem");
+  shmdt(shm);
   shmctl(shmid, IPC_RMID, NULL);
   exit(0);
 }
@@ -96,18 +116,18 @@ void read_file(){
   while (fgets(line, 256, fp)){
     sscanf(line, "%[^;];%[^;];%[^\n]", username, password, role);
     if(strcmp(role, "administrador") == 0){
-      users[users_size].role = 1;
+      shm->users[shm->users_size].role = 1;
     }else if(strcmp(role, "jornalista") == 0){
-      users[users_size].role = 2;
+      shm->users[shm->users_size].role = 2;
     }else if(strcmp(role, "leitor") == 0){
-      users[users_size].role = 3;
+      shm->users[shm->users_size].role = 3;
     }else{
       printf("Error wrong role\n");
       continue;
     }     
-    strcpy(users[users_size].username, username);
-    strcpy(users[users_size].password, password);
-    users_size++;
+    strcpy(shm->users[shm->users_size].username, username);
+    strcpy(shm->users[shm->users_size].password, password);
+    shm->users_size++;
   }
 }
 
@@ -128,13 +148,13 @@ unsigned int login(char * buffer){
         sprintf(buf, "ERROR: use format LOGIN {username} {password}\n");
       else{
         int i;
-        for(i = 0; i < users_size; i++){
-          if(strcmp(users[i].username, username) == 0 && strcmp(users[i].password, password) == 0 && users[i].role == 1){ // 1 means admin
+        for(i = 0; i < shm->users_size; i++){
+          if(strcmp(shm->users[i].username, username) == 0 && strcmp(shm->users[i].password, password) == 0 && shm->users[i].role == 1){ // 1 means admin
             sprintf(buf, "USER LOGGED IN\n");
             break;
           }
         }
-        if(i == users_size)
+        if(i == shm->users_size)
           sprintf(buf, "ERROR: invalid username or password\n");
       }
     }else{
@@ -161,39 +181,139 @@ unsigned int login(char * buffer){
   }
 }
 
+void create_topic(char* id, char* name){
+
+  if ((shm->topics[shm->topics_size].multicast_socket = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+    perror("socket");
+    exit(1);
+  }
+
+  // set up the multicast address structure
+  memset(&shm->topics[shm->topics_size].addr, 0, sizeof(shm->topics[shm->topics_size].addr));
+  shm->topics[shm->topics_size].addr.sin_family = AF_INET;
+  shm->topics[shm->topics_size].addr.sin_addr.s_addr = inet_addr("239.0.0.1");
+  shm->topics[shm->topics_size].addr.sin_port = htons(shm->port);
+
+  // enable multicast on the socket
+  int enable = 1;
+  if (setsockopt(shm->topics[shm->topics_size].multicast_socket, IPPROTO_IP, IP_MULTICAST_TTL, &enable, sizeof(enable)) < 0) {
+    perror("setsockopt");
+    exit(1);
+  }
+
+  strcpy(shm->topics[shm->topics_size].name, name);
+  strcpy(shm->topics[shm->topics_size].id, id);
+  shm->topics_size++;
+  shm->port++;
+
+  close(shm->topics[shm->topics_size].multicast_socket);
+}
+
+int send_news(char* id, char* msg){
+
+  for (int i = 0; i < shm->topics_size; i++){
+    if(strcmp(shm->topics[i].id, id) == 0){
+      sleep(1);      
+      // send the multicast message
+      if (sendto(shm->topics[shm->topics_size].multicast_socket, msg, BUF_SIZE, 0, (struct sockaddr *)&shm->topics[shm->topics_size].addr, sizeof(shm->topics[shm->topics_size].addr)) < 0) {
+        perror("sendto");
+        exit(1);
+      }
+      return 1;
+    }
+  }
+  return 0;
+}
+
 void tcp_client(){
   sem_wait(users_sem);
-  *n_childs = *n_childs+1;
+  shm->n_childs++;
   sem_post(users_sem);
-	int nread;
+	int nread, new_topic;
   // Creates 2 strings for future use
-	char buffer[1024], msg[1246];
+	char buffer[BUF_SIZE], msg[1246], cmd[BUF_SIZE], username[BUF_SIZE], password[BUF_SIZE];
   // Send the message to the conected client
-  sprintf(msg, "Welcome to the news server, login usign: LOGIN {username} {password}\n");
-  write(tcp_client_n, msg, 1024);
+  sprintf(msg, "Welcome to the news server, login usign: LOGIN {username} {password}");
+  write(tcp_client_n, msg, BUF_SIZE);
   do {
     // Leave if ctrl+c is pressed
     if(leave){
-      printf("Closing client\n");
+      printf("\nClosing client\n");
       close(tcp_client_n);
+      sem_wait(users_sem);
+      shm->n_childs++;
+      sem_post(users_sem);
       break;
     }
 
     // Reads the domain sent by the client
-    if((nread = read(tcp_client_n, buffer, 1024)) <= 0) continue;
+    if((nread = read(tcp_client_n, buffer, BUF_SIZE)) <= 0) continue;
+    if(sscanf(buffer, " %s", cmd) != 1) continue;;
 
-    // If the received string equals "SAIR" sends the message "Ate logo!" to client and closes the connection
-    if(strcmp(buffer, "SAIR") != 0){
-      // If no equal domain is found in the file the server sends the message bellow
-      sprintf(msg, "O nome de domínio %s não tem um endereço IP associado", buffer);
-      write(tcp_client_n, msg, 1024);
+    if(strcmp(cmd, "LOGIN") == 0){
+      if(sscanf(buffer, " %s %s %s", cmd, username, password) != 3) continue;
+      sprintf(msg, "0");
+      sem_wait(users_sem);
+      for(int i = 0; i < shm->users_size ; i++){
+        if(strcmp(shm->users[i].username, username) == 0 && strcmp(shm->users[i].password, password) == 0){
+          if(shm->users[i].role == 2){
+            sprintf(msg, "2");
+          }else if(shm->users[i].role == 3){
+            sprintf(msg, "1");
+          }
+        }
+      }
+      sem_post(users_sem);
+      write(tcp_client_n, msg, BUF_SIZE);
+    }else if(strcmp(cmd, "LIST_TOPICS") == 0){
+      sprintf(msg, "ID\tTOPICS\n");
+      sem_wait(topics_sem);
+      for(int i = 0; i < shm->topics_size; i++){
+        sprintf(username ,"%s\t%s\n", shm->topics[i].id, shm->topics[i].name);
+        strcat(msg, username);
+      }
+      sem_post(topics_sem);
+      write(tcp_client_n, msg, BUF_SIZE);
+    }else if(strcmp(cmd, "SUBSCRIBE_TOPIC") == 0){
+      if(sscanf(buffer, " %s %s", cmd, username) != 2) continue;
+      sprintf(msg, "0");
+      sem_wait(topics_sem);
+      for(int i = 0; i < shm->topics_size; i++){
+        if(strcmp(shm->topics[i].id, username) == 0){
+          sprintf(msg, "%d", htons(shm->topics[i].addr.sin_port)); // Change this to add topics to the list of user
+        }
+      }
+      sem_post(topics_sem);
+      write(tcp_client_n, msg, BUF_SIZE);
+    }else if (strcmp(cmd, "CREATE_TOPIC") == 0){  
+      if(sscanf(buffer, " %s %s %s", cmd, username, password) != 3) continue;
+      sprintf(msg, "1");
+      new_topic = 1;
+      sem_wait(topics_sem);
+      for(int i = 0; i < shm->topics_size; i++){
+        if(strcmp(shm->topics[i].id, username) == 0){
+          sprintf(msg, "0");
+          new_topic = 0;
+        }
+      }
+      if(new_topic){
+        create_topic(username, password);
+      }
+      sem_post(topics_sem);
+      write(tcp_client_n, msg, BUF_SIZE);
+    }else if (strcmp(cmd, "SEND_NEWS") == 0){
+      if(sscanf(buffer, " %s %s %s", cmd, username, password) != 3) continue;
+      sem_wait(topics_sem);
+      if(send_news(username, password))
+        sprintf(msg, "1");
+      else
+        sprintf(msg, "0");
+      sem_post(topics_sem);
+      write(tcp_client_n, msg, BUF_SIZE);
     }else{
       // If the message sent by the client is equal to "SAIR" the server responds with the message "Ate logo!" 
       sprintf(msg, "Até logo!");
-      write(tcp_client_n, msg, 1024);
-      sem_wait(users_sem);
-      *n_childs = *n_childs+1;
-      sem_post(users_sem);
+      write(tcp_client_n, msg, BUF_SIZE);
       break;
     }
 	  fflush(stdout);
@@ -217,12 +337,12 @@ void *udp_server(){
 
   // Filling UDP socket
 	si_udp.sin_family = AF_INET;
-	si_udp.sin_port = htons(port_cofig);
 	si_udp.sin_addr.s_addr = htonl(INADDR_ANY);
+	si_udp.sin_port = htons(port_cofig);
 
 	// Bind the socket with the ip
 	if(bind(udp_socket,(struct sockaddr*)&si_udp, sizeof(si_udp)) == -1) {
-		error("Erro no bind");
+		error("Erro no bind multicast");
 	}
  
   while (strcmp(cmd, "QUIT_SERVER") != 0){
@@ -253,9 +373,9 @@ void *udp_server(){
     if(strcmp(cmd, "LIST") == 0){
       sprintf(buf, "\nLISTING ALL USERS\nUSERNAME\tROLE\n");
       sem_wait(users_sem);
-      for(int i = 0; i < users_size; i++){
-        strcat(buf, users[i].username);
-        strcat(buf, users[i].role == 1 ? "\t\tadmin\n" : users[i].role == 2 ? "\t\tjournalist\n" : "\t\tclient\n");
+      for(int i = 0; i < shm->users_size; i++){
+        strcat(buf, shm->users[i].username);
+        strcat(buf, shm->users[i].role == 1 ? "\t\tadmin\n" : shm->users[i].role == 2 ? "\t\tjournalist\n" : "\t\tclient\n");
       }
       sem_post(users_sem);
     }else if(strcmp(cmd, "DEL") == 0){
@@ -264,10 +384,10 @@ void *udp_server(){
       else{
         sem_wait(users_sem);
         sprintf(buf, "User %s not found\n", username); 
-        for(int i = 0; i < users_size; i++){
-          if(strcmp(users[i].username, username) == 0){
-            users[i] = users[users_size-1];
-            users_size--;
+        for(int i = 0; i < shm->users_size; i++){
+          if(strcmp(shm->users[i].username, username) == 0){
+            shm->users[i] = shm->users[shm->users_size-1];
+            shm->users_size--;
             sprintf(buf, "User %s deleted\n", username);
             break;
           }
@@ -281,19 +401,19 @@ void *udp_server(){
       else
         if(strcmp(role, "admin") == 0 || strcmp(role, "journalist") == 0 || strcmp(role, "client")){
           sem_wait(users_sem);
-          if(users_size < MAX_USERS){
-            for(int i = 0; i < users_size; i++){
-              if(strcmp(users[i].username, username) == 0){
+          if(shm->users_size < MAX_USERS){
+            for(int i = 0; i < shm->users_size; i++){
+              if(strcmp(shm->users[i].username, username) == 0){
                 sprintf(buf, "ERROR: username already exists\n");
                 new_user = 0;
                 break;
               }
             }
             if(new_user){
-              strcpy(users[users_size].username, username);
-              strcpy(users[users_size].password, password);
-              users[users_size].role = strcmp(role, "admin") == 0 ? 1 : strcmp(role, "journalist") == 0 ? 2 : 3;
-              users_size++;
+              strcpy(shm->users[shm->users_size].username, username);
+              strcpy(shm->users[shm->users_size].password, password);
+              shm->users[shm->users_size].role = strcmp(role, "admin") == 0 ? 1 : strcmp(role, "journalist") == 0 ? 2 : 3;
+              shm->users_size++;
               sprintf(buf, "User %s added with role %s\n", username, role);
             }
           }else
@@ -365,17 +485,25 @@ void syc_creator(){
       }
   }
 
-  if((shmid = shmget(IPC_PRIVATE, sizeof(User)*MAX_USERS + sizeof(int), IPC_CREAT | 0777)) == -1){
+  if((topics_sem = sem_open("topics_sem", O_CREAT | O_EXCL, 0700, 1)) == SEM_FAILED){
+      if((topics_sem = sem_open("topics_sem", 0)) == SEM_FAILED){
+        error("Error opening semaphore");
+      }
+  }
+
+  if((shmid = shmget(IPC_PRIVATE, sizeof(Shm)+sizeof(User)*MAX_USERS + sizeof(Topic)*MAX_TOPICS, IPC_CREAT | 0777)) == -1){
     error("Error creating shared memory");
   }
-  
 
-  if((users = (User*)shmat(shmid, NULL, 0)) == (void*)-1){
+  if((shm = (Shm*)shmat(shmid, NULL, 0)) == (void*)-1){
     error("Error attaching shared memory");
   }
-
-  n_childs = (int*)(((void*) users) + MAX_USERS*sizeof(User));
-  *n_childs = 0;
+  shm->users = (User*)((char*)shm + sizeof(Shm));
+  shm->topics = (Topic*)((char*)shm + sizeof(Shm) + sizeof(User)*MAX_USERS);
+  shm->n_childs = 0;
+  shm->users_size = 0;
+  shm->users_size = 0;
+  shm->port = 1025;
 }
 
 void ctrlc_handler(){
@@ -426,7 +554,7 @@ int main(int argc, char* argv[]) {
   tcp_server();
 
   pthread_join(udp_server_t, NULL);
-   
+
   cleanup();
 
 	return 0;
