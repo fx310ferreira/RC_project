@@ -148,8 +148,6 @@ unsigned int login(char * buffer){
   strcpy(buf, buffer);
    // User login
   while(1){
-
-
     if(sscanf(buf, " %s", cmd) != 1){
       sprintf(buf, "ERROR: invalid format\n");
     }
