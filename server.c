@@ -16,12 +16,11 @@
 #include <netdb.h>
 #include <sys/wait.h>
 
-
-// ! QUIT SERVER WHEN WRITING QUIT_SERVER BEFORE LOGIN
 #define BUFLEN 2056	// Tamanho do buffer
 #define SIZE 128 
 #define BUF_SIZE 1024
 #define MAX_USERS 100
+#define MAX_WORKERS 100
 #define MAX_TOPICS 100
 typedef struct User{
   char username[SIZE];
@@ -42,6 +41,7 @@ typedef struct Shm{
   User* users;
   Topic* topics;
   int n_childs;
+  int worker_pid[MAX_WORKERS];
   int users_size;
   int topics_size;
   int port;
@@ -60,7 +60,6 @@ void save_file(){
   FILE *fp = fopen(config_file, "w");
 
   int i;
-  if (shm != NULL)
   for(i = 0; i < shm->users_size; i++){
     fprintf(fp, "%s;%s;", shm->users[i].username, shm->users[i].password);
     if(shm->users[i].role == 1){
@@ -86,6 +85,9 @@ void cleanup(){
   printf("Wating for workers to exit\n");
   if( shm != NULL){
     for (int i = 0; i < shm->n_childs; i++){
+      kill(shm->worker_pid[i], SIGUSR1);
+    }
+    for (int i = 0; i < shm->n_childs; i++){
       wait(NULL);
     }
     for (int i = 0; i < shm->topics_size; i++){
@@ -94,7 +96,7 @@ void cleanup(){
   }
   
   //saves data to the file
-  save_file();
+  // save_file();
   //closing the udp socket
   close(udp_socket);
   if(close(tcp_socket) < 0){
@@ -208,7 +210,7 @@ void create_topic(char* id, char* name){
   shm->topics[shm->topics_size].addr.sin_port = htons(shm->port);
 
   // enable multicast on the socket
-  int enable = 1;
+  int enable = 10;
   if (setsockopt(shm->topics[shm->topics_size].multicast_socket, IPPROTO_IP, IP_MULTICAST_TTL, &enable, sizeof(enable)) < 0) {
     perror("setsockopt");
     exit(1);
@@ -235,10 +237,7 @@ int send_news(char* id, char* msg){
   return 0;
 }
 
-void tcp_client(){
-  sem_wait(users_sem);
-  shm->n_childs++;
-  sem_post(users_sem);
+void tcp_client(){  
 	int nread, new_topic;
   // Creates 2 strings for future use
 	char buffer[BUF_SIZE], msg[1246], cmd[BUF_SIZE], username[BUF_SIZE], password[BUF_SIZE];
@@ -353,6 +352,7 @@ void *udp_server(){
   char buf[BUFLEN], cmd[BUFLEN], username[SIZE], password[SIZE], role[SIZE];
   unsigned int current_user = 0;
   int new_user = 1;
+  int leave = 0;
 
   udp_thread = 1;
 
@@ -371,7 +371,7 @@ void *udp_server(){
 		error("Erro no bind multicast");
 	}
  
-  while (strcmp(cmd, "QUIT_SERVER") != 0){
+  while (!leave){
     memset(buf, '\0', BUFLEN);
 
 	  // Wait to receive message
@@ -452,7 +452,8 @@ void *udp_server(){
       sprintf(buf, "Received order quit\n");
       current_user = 0;
     }else if(strcmp(cmd, "QUIT_SERVER") == 0){
-      sprintf(buf, "Quiting server\n"); 
+      sprintf(buf, "Quiting server\n");
+      leave = 1;
     }else{
       sprintf(buf, "ERROR: invalid command\n");
     }
@@ -461,7 +462,14 @@ void *udp_server(){
     }
   }
   udp_thread = 0;
+  cleanup();
   pthread_exit(NULL);
+}
+
+void worker_killer(){
+  printf("Killing worker\n");
+  close(tcp_client_n);
+  exit(0);
 }
 
 void tcp_server(){
@@ -487,7 +495,15 @@ void tcp_server(){
     tcp_client_n = accept(tcp_socket,(struct sockaddr *)&client_addr,(socklen_t *)&client_addr_size);
     
     if (tcp_client_n > 0) {
-      if (fork() == 0) {
+      if ((shm->worker_pid[shm->n_childs] = fork()) == 0) {
+        sem_wait(users_sem);
+        shm->n_childs++;
+        sem_post(users_sem);
+        struct sigaction ctrlc;
+        ctrlc.sa_handler = worker_killer;
+        sigfillset(&ctrlc.sa_mask);
+        ctrlc.sa_flags = 0;
+        sigaction(SIGINT, &ctrlc, NULL);
         close(tcp_socket);
         tcp_client();
         exit(0);
@@ -528,7 +544,7 @@ void syc_creator(){
   shm->topics = (Topic*)((char*)shm + sizeof(Shm) + sizeof(User)*MAX_USERS);
   shm->n_childs = 0;
   shm->users_size = 0;
-  shm->users_size = 0;
+  shm->topics_size = 0;
   shm->port = 1025;
 }
 
@@ -554,6 +570,7 @@ int main(int argc, char* argv[]) {
   sigset_t mask;
   sigfillset(&mask);
   sigdelset(&mask, SIGINT);
+  sigdelset(&mask, SIGUSR1);
   sigprocmask(SIG_SETMASK, &mask, NULL);
 
   if(argc != 4)
