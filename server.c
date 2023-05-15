@@ -27,6 +27,8 @@ typedef struct User{
   char username[SIZE];
   char password[SIZE];
   int role;
+  int ports[MAX_TOPICS];
+  int n_topics;
 } User;
 
 typedef struct Topic{
@@ -48,6 +50,7 @@ typedef struct Shm{
 char config_file[BUFLEN];
 int shmid;
 Shm *shm;
+int count = 0;
 int udp_socket,recv_len, port_cofig, tcp_port, udp_thread = 0, tcp_client_n, parent_pid, tcp_socket, leave = 0;
 struct sockaddr_in si_upd_client;
 pthread_t udp_server_t;
@@ -57,6 +60,7 @@ void save_file(){
   FILE *fp = fopen(config_file, "w");
 
   int i;
+  if (shm != NULL)
   for(i = 0; i < shm->users_size; i++){
     fprintf(fp, "%s;%s;", shm->users[i].username, shm->users[i].password);
     if(shm->users[i].role == 1){
@@ -76,19 +80,26 @@ void cleanup(){
   printf("Closing server\n");
   if(udp_thread){
     pthread_cancel(udp_server_t);
+    pthread_join(udp_server_t, NULL);
   }
-  pthread_join(udp_server_t, NULL);
 
   printf("Wating for workers to exit\n");
-  for (int i = 0; i < shm->n_childs; i++){
-    wait(NULL);
+  if( shm != NULL){
+    for (int i = 0; i < shm->n_childs; i++){
+      wait(NULL);
+    }
+    for (int i = 0; i < shm->topics_size; i++){
+      close(shm->topics[i].multicast_socket);
+    }
   }
   
   //saves data to the file
   save_file();
   //closing the udp socket
   close(udp_socket);
-  close(tcp_socket);
+  if(close(tcp_socket) < 0){
+    printf("Error closing tcp socket\n");
+  }
   sem_close(users_sem);
   sem_unlink("users_sem");
   sem_close(topics_sem);
@@ -182,11 +193,13 @@ unsigned int login(char * buffer){
 }
 
 void create_topic(char* id, char* name){
-
+  
+  printf("CREATING SOCKET to %d %d\n",shm->topics_size, shm->topics[shm->topics_size].multicast_socket);
   if ((shm->topics[shm->topics_size].multicast_socket = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
     perror("socket");
     exit(1);
   }
+  printf("SOCKET created to %d %d\n",shm->topics_size, shm->topics[shm->topics_size].multicast_socket);
 
   // set up the multicast address structure
   memset(&shm->topics[shm->topics_size].addr, 0, sizeof(shm->topics[shm->topics_size].addr));
@@ -206,16 +219,13 @@ void create_topic(char* id, char* name){
   shm->topics_size++;
   shm->port++;
 
-  close(shm->topics[shm->topics_size].multicast_socket);
 }
 
 int send_news(char* id, char* msg){
-
   for (int i = 0; i < shm->topics_size; i++){
     if(strcmp(shm->topics[i].id, id) == 0){
-      sleep(1);      
       // send the multicast message
-      if (sendto(shm->topics[shm->topics_size].multicast_socket, msg, BUF_SIZE, 0, (struct sockaddr *)&shm->topics[shm->topics_size].addr, sizeof(shm->topics[shm->topics_size].addr)) < 0) {
+      if (sendto(shm->topics[i].multicast_socket, msg, BUF_SIZE, 0, (struct sockaddr *)&shm->topics[i].addr, sizeof(shm->topics[i].addr)) < 0) {
         perror("sendto");
         exit(1);
       }
@@ -240,9 +250,6 @@ void tcp_client(){
     if(leave){
       printf("\nClosing client\n");
       close(tcp_client_n);
-      sem_wait(users_sem);
-      shm->n_childs++;
-      sem_post(users_sem);
       break;
     }
 
@@ -257,9 +264,13 @@ void tcp_client(){
       for(int i = 0; i < shm->users_size ; i++){
         if(strcmp(shm->users[i].username, username) == 0 && strcmp(shm->users[i].password, password) == 0){
           if(shm->users[i].role == 2){
-            sprintf(msg, "2");
+            sprintf(msg, "1"); //journalist
           }else if(shm->users[i].role == 3){
-            sprintf(msg, "1");
+            sprintf(msg, "2 "); //client
+            for(int j = 0; j < shm->users[i].n_topics; j++){
+              sprintf(username, "%d ", shm->users[i].ports[j]);
+              strcat(msg, username);
+            }
           }
         }
       }
@@ -275,14 +286,22 @@ void tcp_client(){
       sem_post(topics_sem);
       write(tcp_client_n, msg, BUF_SIZE);
     }else if(strcmp(cmd, "SUBSCRIBE_TOPIC") == 0){
-      if(sscanf(buffer, " %s %s", cmd, username) != 2) continue;
+      if(sscanf(buffer, " %s %s %s", cmd, password, username) != 3) continue;
       sprintf(msg, "0");
       sem_wait(topics_sem);
       for(int i = 0; i < shm->topics_size; i++){
-        if(strcmp(shm->topics[i].id, username) == 0){
-          sprintf(msg, "%d", htons(shm->topics[i].addr.sin_port)); // Change this to add topics to the list of user
+        if(strcmp(shm->topics[i].id, password) == 0){
+          sem_wait(users_sem);
+          for (int j = 0; j < shm->users_size; j++){
+            if(strcmp(shm->users[j].username, username) == 0){
+              shm->users[j].ports[shm->users[j].n_topics] = htons(shm->topics[i].addr.sin_port);
+              shm->users[j].n_topics++;
+            }
+          }
+          sem_post(users_sem);
+          sprintf(msg, "%d", htons(shm->topics[i].addr.sin_port));
         }
-      }
+      }      
       sem_post(topics_sem);
       write(tcp_client_n, msg, BUF_SIZE);
     }else if (strcmp(cmd, "CREATE_TOPIC") == 0){  
@@ -310,15 +329,22 @@ void tcp_client(){
         sprintf(msg, "0");
       sem_post(topics_sem);
       write(tcp_client_n, msg, BUF_SIZE);
+    }else if (strcmp(cmd, "LEAVE") == 0){
+      sprintf(msg, "OK");
+      write(tcp_client_n, msg, BUF_SIZE);
+      close(tcp_client_n);
+      sem_wait(users_sem);
+      shm->n_childs--;
+      sem_post(users_sem);
+      return;
     }else{
       // If the message sent by the client is equal to "SAIR" the server responds with the message "Ate logo!" 
-      sprintf(msg, "Até logo!");
+      sprintf(msg, "UNKNOWN COMMAND");
       write(tcp_client_n, msg, BUF_SIZE);
       break;
     }
 	  fflush(stdout);
   } while (1);
-	close(tcp_client_n);
 }
 
 void *udp_server(){

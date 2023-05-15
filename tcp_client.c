@@ -10,45 +10,80 @@
 #include <signal.h>
 #include <pthread.h>
 
+#define MAX_TOPICS 100
+
 void erro(char *msg) {
   printf("Erro: %s\n", msg);
 	exit(-1);
 }
+typedef struct Topics{
+  struct sockaddr_in addr;
+  socklen_t slen;
+  int multicast_socket;
+}Topics;
 
-int leave = 0;
 int fd, role = 0;
 pthread_t multicast_thread_t;
+Topics topics[MAX_TOPICS];
+int topics_count = 0;
+int max_fd = 0;
+
 
 void ctrlc_handler(){
-  leave = 1;
+  char msg[1024];
+  sprintf(msg, "LEAVE");
+  write(fd, msg, 1024);
+  read(fd, msg, 1024);
+  pthread_cancel(multicast_thread_t);
+  pthread_join(multicast_thread_t, NULL);
+  if(!strcmp(msg, "OK")){
+    printf("\nConnection closed\n");
+  if(close(fd) < 0){
+      printf("\nError closing connection\n");
+      exit(1);
+  }
+    struct ip_mreq mreq;
+    mreq.imr_multiaddr.s_addr = inet_addr("239.0.0.1");
+    mreq.imr_interface.s_addr = INADDR_ANY;
+    for(int i = 0; i < topics_count; i++){
+      // leave the multicast group
+      if (setsockopt(topics[i].multicast_socket, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
+        perror("setsockopt");
+        exit(1);
+      }
+      close(topics[i].multicast_socket);
+    }
+    exit(0);
+  }
+  else{
+    printf("\nError closing connection\n");
+    close(fd);
+    exit(1);
+  }
 }
 
-void *multicast_thread(){
-  struct sockaddr_in addr;
-  socklen_t slen = sizeof(addr);
-  int multicast_socket;
-
-  if ((multicast_socket = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+void join_socket(int port){
+  
+  if ((topics[topics_count].multicast_socket = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
     perror("socket");
     exit(1);
   }
+
   // set up the multicast address structure
-  memset(&addr, 0, sizeof(addr));
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_ANY);
-  addr.sin_port = htons(1025);
+  memset(&topics[topics_count].addr, 0, sizeof(topics[topics_count].addr));
+  topics[topics_count].addr.sin_family = AF_INET;
+  topics[topics_count].addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  topics[topics_count].addr.sin_port = htons(port);
 
   // set the SO_REUSEADDR option
   int optval = 1;
-  if (setsockopt(multicast_socket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
+  if (setsockopt(topics[topics_count].multicast_socket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
       perror("setsockopt");
       exit(1);
   }
 
-
-  char msg[1024];
   // bind the socket to the port
-  if (bind(multicast_socket, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+  if (bind(topics[topics_count].multicast_socket, (struct sockaddr *)&topics[topics_count].addr, sizeof(topics[topics_count].addr)) < 0) {
     perror("multicast bind");
     exit(1);
   }
@@ -57,21 +92,41 @@ void *multicast_thread(){
   struct ip_mreq mreq;
   mreq.imr_multiaddr.s_addr = inet_addr("239.0.0.1");
   mreq.imr_interface.s_addr = INADDR_ANY;
-  if (setsockopt(multicast_socket, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
+  if (setsockopt(topics[topics_count].multicast_socket, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
     perror("multicast setsockopt");
     exit(1);
   }
-
-  int nbytes;
-  if ((nbytes = recvfrom(multicast_socket, msg, sizeof(msg), 0, (struct sockaddr *)&addr, &slen)) < 0) {
-    perror("multicast recvfrom");
-    exit(1);
+  if(topics[topics_count].multicast_socket > max_fd){
+    max_fd = topics[topics_count].multicast_socket;
   }
-printf("Received multicast message: %s\n", msg);
+  topics_count++;
+}
 
-// close the socket
-close(multicast_socket);
+void *multicast_thread(){
+  int n;
+  char msg[1024];
+  fd_set rfds;
+  struct timeval tv;
+  tv.tv_sec = 5;
+  tv.tv_usec = 0;
 
+  socklen_t slen = sizeof(struct sockaddr_in);
+  while(1){
+    memset(msg, 0, sizeof(msg));
+    FD_ZERO(&rfds);
+    for (int i = 0; i < topics_count; i++){
+      FD_SET(topics[i].multicast_socket, &rfds);
+    }
+    select(max_fd + 1, &rfds, NULL, NULL, &tv);
+    for (int i = 0; i < topics_count; i++){
+      if(FD_ISSET(topics[i].multicast_socket, &rfds)){
+        if ((n = recvfrom(topics[i].multicast_socket, msg, sizeof(msg), 0, (struct sockaddr *)&topics[i].addr, &slen)) < 0) {
+          perror("multicast recvfrom");
+        }
+        printf("Received multicast message: %s\n", msg);
+      }
+    }
+  }
   pthread_exit(NULL);
 }
 
@@ -80,6 +135,7 @@ int main(int argc, char *argv[]) {
   int  nread, temp;
   struct sockaddr_in addr;
   struct hostent *hostPtr;
+  char user[1024];
 
 
   if (argc != 3) {
@@ -152,24 +208,36 @@ int main(int argc, char *argv[]) {
         printf("Invalid username or password\n");
         continue;
       }else if (role == 1){
-        printf("Reader logged in\n");
-        continue;
-      }else if (role == 2){
         printf("Journalist logged in\n");
         continue;
+      }else if (role == 2){
+        printf("Reader logged in\n");
+        strcpy(user, username);
+        char* token = strtok(msg, " ");
+        int port = 0;
+        while (token != NULL) {
+            token = strtok(NULL, " ");
+            if(token == NULL){
+              break;
+            }
+            sscanf(token, "%d", &port);
+            join_socket(port);
+        }
+        continue;
       }
-    }else if(!strcmp(cmd, "LIST_TOPICS") && role == 1){
+    }else if(!strcmp(cmd, "LIST_TOPICS") && role == 2){
       // Sends the domain to the server
       write(fd, msg, 1024);
       // Waits for the server response to the given domain
       read(fd, msg, 1024);
       // Prints the response from the server
       printf("%s\n", msg);
-    }else if(!strcmp(cmd, "SUBSCRIBE_TOPIC") && role == 1){
+    }else if(!strcmp(cmd, "SUBSCRIBE_TOPIC") && role == 2){
       if(sscanf(msg, " %s %s", cmd, aux) != 2){
         printf("SUBSCRIBE_TOPIC {topic}\n");
         continue;
       }
+      sprintf(msg, "%s %s %s", cmd, aux, user);
       write(fd, msg, 1024);
       read(fd, msg, 1024);
       if(sscanf(msg, " %d", &temp) != 1){
@@ -180,10 +248,11 @@ int main(int argc, char *argv[]) {
         printf("Invalid topic\n");
         continue;
       }else{
-        printf("You are now subscribed in this topic with multicast port: %d\n", temp);
+        printf("You are now subscribed in this topic\n");
+        join_socket(temp);
         continue;
       }
-    }else if(!strcmp(cmd, "SEND_NEWS") && role == 2){
+    }else if(!strcmp(cmd, "SEND_NEWS") && role == 1){
       if(sscanf(msg, " %s %s %s", cmd, aux, aux) != 3){
         printf("SEND_NEWS {topic} {news}\n");
         continue;
@@ -201,7 +270,7 @@ int main(int argc, char *argv[]) {
         printf("News sent\n");
         continue;
       }
-    }else if(!strcmp(cmd, "CREATE_TOPIC") && role == 2){
+    }else if(!strcmp(cmd, "CREATE_TOPIC") && role == 1){
       if(sscanf(msg, " %s %s %s", cmd, username, password) != 3){
         printf("CREATE_TOPIC {id} {topic}\n");
         continue;
@@ -227,10 +296,5 @@ int main(int argc, char *argv[]) {
       continue;
     }
   
-  pthread_join(multicast_thread_t, NULL);
-
-  }while (!leave); // If the server response is the string "Ate logo!" the connection is closed
-  printf("\nConnection closed\n");
-  close(fd);
-  exit(0);
+  }while (1); // If the server response is the string "Ate logo!" the connection is closed
 }
