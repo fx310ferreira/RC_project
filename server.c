@@ -85,9 +85,6 @@ void cleanup(){
   printf("Wating for workers to exit\n");
   if( shm != NULL){
     for (int i = 0; i < shm->n_childs; i++){
-      kill(shm->worker_pid[i], SIGUSR1);
-    }
-    for (int i = 0; i < shm->n_childs; i++){
       wait(NULL);
     }
     for (int i = 0; i < shm->topics_size; i++){
@@ -249,7 +246,7 @@ void tcp_client(){
     if(leave){
       printf("\nClosing client\n");
       close(tcp_client_n);
-      break;
+      return;
     }
 
     // Reads the domain sent by the client
@@ -331,10 +328,10 @@ void tcp_client(){
     }else if (strcmp(cmd, "LEAVE") == 0){
       sprintf(msg, "OK");
       write(tcp_client_n, msg, BUF_SIZE);
-      close(tcp_client_n);
       sem_wait(users_sem);
       shm->n_childs--;
       sem_post(users_sem);
+      close(tcp_client_n);
       return;
     }else{
       // If the message sent by the client is equal to "SAIR" the server responds with the message "Ate logo!" 
@@ -466,12 +463,6 @@ void *udp_server(){
   pthread_exit(NULL);
 }
 
-void worker_killer(){
-  printf("Killing worker\n");
-  close(tcp_client_n);
-  exit(0);
-}
-
 void tcp_server(){
   struct sockaddr_in addr, client_addr;
   int client_addr_size;
@@ -499,13 +490,9 @@ void tcp_server(){
         sem_wait(users_sem);
         shm->n_childs++;
         sem_post(users_sem);
-        struct sigaction ctrlc;
-        ctrlc.sa_handler = worker_killer;
-        sigfillset(&ctrlc.sa_mask);
-        ctrlc.sa_flags = 0;
-        sigaction(SIGINT, &ctrlc, NULL);
         close(tcp_socket);
         tcp_client();
+        printf("CLOSED THE WORKER\n");
         exit(0);
       }
     close(tcp_client_n);
@@ -570,7 +557,6 @@ int main(int argc, char* argv[]) {
   sigset_t mask;
   sigfillset(&mask);
   sigdelset(&mask, SIGINT);
-  sigdelset(&mask, SIGUSR1);
   sigprocmask(SIG_SETMASK, &mask, NULL);
 
   if(argc != 4)

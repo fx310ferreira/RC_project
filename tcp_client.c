@@ -47,7 +47,6 @@ void ctrlc_handler()
     if (close(fd) < 0)
     {
       printf("\nError closing connection\n");
-      exit(1);
     }
     struct ip_mreq mreq;
     mreq.imr_multiaddr.s_addr = inet_addr("239.0.0.1");
@@ -58,7 +57,6 @@ void ctrlc_handler()
       if (setsockopt(topics[i].multicast_socket, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq, sizeof(mreq)) < 0)
       {
         perror("setsockopt");
-        exit(1);
       }
       close(topics[i].multicast_socket);
     }
